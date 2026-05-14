@@ -1,0 +1,400 @@
+;; ─────────────────────────────────────────────────────────────
+;; SafeDeal Escrow — TON Smart Contract (FunC)
+;; Works natively inside Telegram (TON Space wallet built-in)
+;; ─────────────────────────────────────────────────────────────
+
+;; ── Op Codes (what action the message is requesting) ──────────
+const int op::create_deal      = 0x1;
+const int op::fund_deal        = 0x2;
+const int op::mark_delivered   = 0x3;
+const int op::confirm_receipt  = 0x4;
+const int op::open_dispute     = 0x5;
+const int op::resolve_dispute  = 0x6;
+const int op::auto_release     = 0x7;
+const int op::cancel_deal      = 0x8;
+const int op::set_channel_fee  = 0x9;
+
+;; ── Deal Status Codes ─────────────────────────────────────────
+const int status::pending_payment = 0;
+const int status::funded          = 1;
+const int status::delivered       = 2;
+const int status::completed       = 3;
+const int status::disputed        = 4;
+const int status::refunded        = 5;
+const int status::cancelled       = 6;
+
+;; ── Fee Constants ─────────────────────────────────────────────
+const int PLATFORM_FEE_BPS  = 200;   ;; 2%
+const int MAX_CHANNEL_FPS   = 1000;  ;; 10% max
+const int BPS_DENOM         = 10000;
+
+;; ─────────────────────────────────────────────────────────────
+;; Storage layout (packed into contract's c4 cell):
+;;
+;;  platform_wallet: MsgAddress
+;;  next_deal_id:    uint64
+;;  deals_dict:      dict(uint64 -> Deal cell)
+;;  channel_fees:    dict(MsgAddress -> uint32)  ;; feeBps per channel
+;;  arbitrators:     dict(MsgAddress -> bool)
+;; ─────────────────────────────────────────────────────────────
+
+(slice, int, cell, cell, cell) load_storage() inline {
+    slice ds = get_data().begin_parse();
+    return (
+        ds~load_msg_addr(),   ;; platform_wallet
+        ds~load_uint(64),     ;; next_deal_id
+        ds~load_dict(),       ;; deals_dict
+        ds~load_dict(),       ;; channel_fees
+        ds~load_dict()        ;; arbitrators
+    );
+}
+
+() save_storage(slice platform_wallet, int next_id, cell deals, cell fees, cell arbs) impure inline {
+    set_data(
+        begin_cell()
+            .store_slice(platform_wallet)
+            .store_uint(next_id, 64)
+            .store_dict(deals)
+            .store_dict(fees)
+            .store_dict(arbs)
+        .end_cell()
+    );
+}
+
+;; ─────────────────────────────────────────────────────────────
+;; Deal cell layout:
+;;  seller:         MsgAddress
+;;  buyer:          MsgAddress
+;;  amount:         uint128  (nanoTON or jetton units)
+;;  seller_gets:    uint128
+;;  platform_fee:   uint128
+;;  channel_fee:    uint128
+;;  channel_wallet: MsgAddress
+;;  guarantee_end:  uint64   (unix timestamp)
+;;  status:         uint8
+;;  is_jetton:      uint1    (0=TON native, 1=Jetton token)
+;;  jetton_wallet:  MsgAddress (only if is_jetton=1)
+;; ─────────────────────────────────────────────────────────────
+
+cell pack_deal(slice seller, slice buyer, int amount, int seller_gets,
+               int plat_fee, int chan_fee, slice chan_wallet,
+               int guarantee_end, int status, int is_jetton, slice jetton_wallet) inline {
+    return begin_cell()
+        .store_slice(seller)
+        .store_slice(buyer)
+        .store_uint(amount,       128)
+        .store_uint(seller_gets,  128)
+        .store_uint(plat_fee,     128)
+        .store_uint(chan_fee,      128)
+        .store_slice(chan_wallet)
+        .store_uint(guarantee_end, 64)
+        .store_uint(status,         8)
+        .store_uint(is_jetton,      1)
+        .store_slice(jetton_wallet)
+    .end_cell();
+}
+
+(slice, slice, int, int, int, int, slice, int, int, int, slice) unpack_deal(cell c) inline {
+    slice s = c.begin_parse();
+    return (
+        s~load_msg_addr(),   ;; seller
+        s~load_msg_addr(),   ;; buyer
+        s~load_uint(128),    ;; amount
+        s~load_uint(128),    ;; seller_gets
+        s~load_uint(128),    ;; platform_fee
+        s~load_uint(128),    ;; channel_fee
+        s~load_msg_addr(),   ;; channel_wallet
+        s~load_uint(64),     ;; guarantee_end
+        s~load_uint(8),      ;; status
+        s~load_uint(1),      ;; is_jetton
+        s~load_msg_addr()    ;; jetton_wallet
+    );
+}
+
+;; ─────────────────────────────────────────────────────────────
+;; Send TON helper
+;; ─────────────────────────────────────────────────────────────
+() send_tons(slice to, int amount, int mode) impure inline {
+    if (amount <= 0) { return (); }
+    send_raw_message(
+        begin_cell()
+            .store_uint(0x18, 6)
+            .store_slice(to)
+            .store_coins(amount)
+            .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+        .end_cell(),
+        mode
+    );
+}
+
+;; ─────────────────────────────────────────────────────────────
+;; Main recv_internal — handles all incoming messages
+;; ─────────────────────────────────────────────────────────────
+() recv_internal(int msg_value, cell in_msg_full, slice in_msg_body) impure {
+    if (in_msg_body.slice_empty?()) { return (); }
+
+    slice cs       = in_msg_full.begin_parse();
+    int   flags    = cs~load_uint(4);
+    if (flags & 1) { return (); }          ;; ignore bounced
+
+    slice sender   = cs~load_msg_addr();
+    int   op       = in_msg_body~load_uint(32);
+    int   query_id = in_msg_body~load_uint(64);
+
+    var (platform_wallet, next_id, deals, chan_fees, arbs) = load_storage();
+
+    ;; ── CREATE DEAL ──────────────────────────────────────
+    if (op == op::create_deal) {
+        slice buyer         = in_msg_body~load_msg_addr();
+        int   amount        = in_msg_body~load_uint(128);
+        int   guarantee_sec = in_msg_body~load_uint(32);  ;; e.g. 86400
+        slice chan_wallet   = in_msg_body~load_msg_addr();
+        int   is_jetton     = in_msg_body~load_uint(1);
+        slice jetton_wallet = in_msg_body~load_msg_addr();
+
+        ;; Look up channel fee
+        (slice fee_slice, int found) = chan_fees.dict_get?(267, chan_wallet);
+        int chan_bps = found ? fee_slice~load_uint(32) : 0;
+
+        int plat_fee   = (amount * PLATFORM_FEE_BPS) / BPS_DENOM;
+        int chan_fee   = (amount * chan_bps) / BPS_DENOM;
+        int seller_amt = amount - plat_fee - chan_fee;
+
+        int deal_id    = next_id;
+        int gend       = now() + guarantee_sec;
+
+        cell deal_cell = pack_deal(
+            sender, buyer, amount, seller_amt,
+            plat_fee, chan_fee, chan_wallet,
+            gend, status::pending_payment,
+            is_jetton, jetton_wallet
+        );
+
+        deals~dict_set(64, deal_id, deal_cell.begin_parse());
+        next_id += 1;
+
+        save_storage(platform_wallet, next_id, deals, chan_fees, arbs);
+        return ();
+    }
+
+    ;; ── FUND DEAL (buyer sends TON) ──────────────────────
+    if (op == op::fund_deal) {
+        int deal_id = in_msg_body~load_uint(64);
+
+        (slice ds, int found) = deals.dict_get?(64, deal_id);
+        throw_unless(404, found);
+
+        cell deal_cell = ds~load_ref();
+        var (seller, buyer, amount, seller_gets, plat_fee, chan_fee,
+             chan_wallet, gend, status, is_jetton, jetton_wallet) = unpack_deal(deal_cell);
+
+        ;; Verify sender is buyer
+        throw_unless(401, equal_slices(sender, buyer));
+        throw_unless(400, status == status::pending_payment);
+
+        ;; For native TON: verify attached value
+        if (is_jetton == 0) {
+            throw_unless(402, msg_value >= amount);
+        }
+
+        ;; Update status to FUNDED
+        deal_cell = pack_deal(
+            seller, buyer, amount, seller_gets, plat_fee, chan_fee,
+            chan_wallet, now() + 86400,  ;; reset guarantee from funding time
+            status::funded, is_jetton, jetton_wallet
+        );
+
+        deals~dict_set(64, deal_id, deal_cell.begin_parse());
+        save_storage(platform_wallet, next_id, deals, chan_fees, arbs);
+        return ();
+    }
+
+    ;; ── MARK DELIVERED (seller) ──────────────────────────
+    if (op == op::mark_delivered) {
+        int deal_id = in_msg_body~load_uint(64);
+        (slice ds, int found) = deals.dict_get?(64, deal_id);
+        throw_unless(404, found);
+
+        cell dc = ds~load_ref();
+        var (seller, buyer, amount, seller_gets, plat_fee, chan_fee,
+             chan_wallet, gend, status, is_jetton, jw) = unpack_deal(dc);
+
+        throw_unless(401, equal_slices(sender, seller));
+        throw_unless(400, status == status::funded);
+
+        dc = pack_deal(seller, buyer, amount, seller_gets, plat_fee, chan_fee,
+                       chan_wallet, gend, status::delivered, is_jetton, jw);
+
+        deals~dict_set(64, deal_id, dc.begin_parse());
+        save_storage(platform_wallet, next_id, deals, chan_fees, arbs);
+        return ();
+    }
+
+    ;; ── CONFIRM RECEIPT (buyer) ──────────────────────────
+    if (op == op::confirm_receipt) {
+        int deal_id = in_msg_body~load_uint(64);
+        (slice ds, int found) = deals.dict_get?(64, deal_id);
+        throw_unless(404, found);
+
+        cell dc = ds~load_ref();
+        var (seller, buyer, amount, seller_gets, plat_fee, chan_fee,
+             chan_wallet, gend, status, is_jetton, jw) = unpack_deal(dc);
+
+        throw_unless(401, equal_slices(sender, buyer));
+        throw_unless(400, (status == status::funded) | (status == status::delivered));
+
+        ;; Release funds
+        send_tons(seller,          seller_gets, 1);
+        send_tons(platform_wallet, plat_fee,    1);
+        if (chan_fee > 0) { send_tons(chan_wallet, chan_fee, 1); }
+
+        dc = pack_deal(seller, buyer, amount, seller_gets, plat_fee, chan_fee,
+                       chan_wallet, gend, status::completed, is_jetton, jw);
+        deals~dict_set(64, deal_id, dc.begin_parse());
+        save_storage(platform_wallet, next_id, deals, chan_fees, arbs);
+        return ();
+    }
+
+    ;; ── AUTO RELEASE (anyone, after timer) ───────────────
+    if (op == op::auto_release) {
+        int deal_id = in_msg_body~load_uint(64);
+        (slice ds, int found) = deals.dict_get?(64, deal_id);
+        throw_unless(404, found);
+
+        cell dc = ds~load_ref();
+        var (seller, buyer, amount, seller_gets, plat_fee, chan_fee,
+             chan_wallet, gend, status, is_jetton, jw) = unpack_deal(dc);
+
+        throw_unless(400, (status == status::funded) | (status == status::delivered));
+        throw_unless(403, now() >= gend);  ;; guarantee must be expired
+
+        send_tons(seller,          seller_gets, 1);
+        send_tons(platform_wallet, plat_fee,    1);
+        if (chan_fee > 0) { send_tons(chan_wallet, chan_fee, 1); }
+
+        dc = pack_deal(seller, buyer, amount, seller_gets, plat_fee, chan_fee,
+                       chan_wallet, gend, status::completed, is_jetton, jw);
+        deals~dict_set(64, deal_id, dc.begin_parse());
+        save_storage(platform_wallet, next_id, deals, chan_fees, arbs);
+        return ();
+    }
+
+    ;; ── OPEN DISPUTE ─────────────────────────────────────
+    if (op == op::open_dispute) {
+        int deal_id = in_msg_body~load_uint(64);
+        (slice ds, int found) = deals.dict_get?(64, deal_id);
+        throw_unless(404, found);
+
+        cell dc = ds~load_ref();
+        var (seller, buyer, amount, seller_gets, plat_fee, chan_fee,
+             chan_wallet, gend, status, is_jetton, jw) = unpack_deal(dc);
+
+        int is_seller = equal_slices(sender, seller);
+        int is_buyer  = equal_slices(sender, buyer);
+        throw_unless(401, is_seller | is_buyer);
+        throw_unless(400, (status == status::funded) | (status == status::delivered));
+
+        ;; Seller can only dispute after guarantee ends
+        if (is_seller) { throw_unless(403, now() >= gend); }
+
+        dc = pack_deal(seller, buyer, amount, seller_gets, plat_fee, chan_fee,
+                       chan_wallet, gend, status::disputed, is_jetton, jw);
+        deals~dict_set(64, deal_id, dc.begin_parse());
+        save_storage(platform_wallet, next_id, deals, chan_fees, arbs);
+        return ();
+    }
+
+    ;; ── RESOLVE DISPUTE (arbitrator only) ────────────────
+    if (op == op::resolve_dispute) {
+        int deal_id    = in_msg_body~load_uint(64);
+        int seller_pct = in_msg_body~load_uint(7);  ;; 0-100
+
+        ;; Check if sender is arbitrator
+        (slice arb_sl, int is_arb) = arbs.dict_get?(267, sender);
+        throw_unless(401, is_arb);
+        throw_unless(400, seller_pct <= 100);
+
+        (slice ds, int found) = deals.dict_get?(64, deal_id);
+        throw_unless(404, found);
+
+        cell dc = ds~load_ref();
+        var (seller, buyer, amount, seller_gets, plat_fee, chan_fee,
+             chan_wallet, gend, status, is_jetton, jw) = unpack_deal(dc);
+
+        throw_unless(400, status == status::disputed);
+
+        if (seller_pct == 0) {
+            ;; Full refund to buyer
+            send_tons(buyer, amount, 1);
+            dc = pack_deal(seller, buyer, amount, seller_gets, plat_fee, chan_fee,
+                           chan_wallet, gend, status::refunded, is_jetton, jw);
+        } else {
+            int to_seller = (seller_gets * seller_pct) / 100;
+            int to_buyer  = amount - to_seller - plat_fee - chan_fee;
+
+            send_tons(seller,          to_seller, 1);
+            send_tons(buyer,           to_buyer,  1);
+            send_tons(platform_wallet, plat_fee,  1);
+            if (chan_fee > 0) { send_tons(chan_wallet, chan_fee, 1); }
+
+            dc = pack_deal(seller, buyer, amount, seller_gets, plat_fee, chan_fee,
+                           chan_wallet, gend, status::completed, is_jetton, jw);
+        }
+
+        deals~dict_set(64, deal_id, dc.begin_parse());
+        save_storage(platform_wallet, next_id, deals, chan_fees, arbs);
+        return ();
+    }
+
+    ;; ── SET CHANNEL FEE ──────────────────────────────────
+    if (op == op::set_channel_fee) {
+        int fee_bps = in_msg_body~load_uint(32);
+        throw_unless(400, fee_bps <= MAX_CHANNEL_FPS);
+
+        chan_fees~dict_set(267, sender,
+            begin_cell().store_uint(fee_bps, 32).end_cell().begin_parse()
+        );
+        save_storage(platform_wallet, next_id, deals, chan_fees, arbs);
+        return ();
+    }
+
+    throw(0xffff); ;; unknown op
+}
+
+;; ─────────────────────────────────────────────────────────────
+;; GET methods (read-only, free to call)
+;; ─────────────────────────────────────────────────────────────
+
+;; Returns deal status as int
+int get_deal_status(int deal_id) method_id {
+    var (_, _, deals, _, _) = load_storage();
+    (slice ds, int found) = deals.dict_get?(64, deal_id);
+    if (~ found) { return -1; }
+    cell dc = ds~load_ref();
+    var (_, _, _, _, _, _, _, _, status, _, _) = unpack_deal(dc);
+    return status;
+}
+
+;; Returns (amount, seller_gets, guarantee_end, status)
+(int, int, int, int) get_deal_info(int deal_id) method_id {
+    var (_, _, deals, _, _) = load_storage();
+    (slice ds, int found) = deals.dict_get?(64, deal_id);
+    throw_unless(404, found);
+    cell dc = ds~load_ref();
+    var (_, _, amount, seller_gets, _, _, _, gend, status, _, _) = unpack_deal(dc);
+    return (amount, seller_gets, gend, status);
+}
+
+;; Returns next deal ID
+int get_next_deal_id() method_id {
+    var (_, next_id, _, _, _) = load_storage();
+    return next_id;
+}
+
+;; Returns channel fee bps
+int get_channel_fee(slice channel_wallet) method_id {
+    var (_, _, _, chan_fees, _) = load_storage();
+    (slice fs, int found) = chan_fees.dict_get?(267, channel_wallet);
+    if (~ found) { return 0; }
+    return fs~load_uint(32);
+}

@@ -1,0 +1,24 @@
+# Telegram Bot
+python-telegram-bot==21.3
+nest_asyncio==1.6.0
+
+# Web3 / Blockchain
+web3==6.20.0
+eth-account==0.11.2
+
+# Database
+sqlalchemy[asyncio]==2.0.31
+asyncpg==0.29.0
+psycopg2-binary==2.9.9
+
+# API
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+pydantic==2.7.1
+pydantic-settings==2.3.4
+
+# Utils
+aiohttp==3.9.5
+apscheduler==3.10.4
+python-dotenv==1.0.1
+aiosqlite==0.20.0
